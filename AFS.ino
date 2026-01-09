@@ -16,6 +16,23 @@
 //software reset!!
 #include <SoftwareReset.hpp>
 
+/*
+custom gcode commands :]
+G48  test X/E at speed
+G0   move x,e
+G28  home x
+M701 Tn	Load filament n
+M702 Tn	Unload filament n
+M704 Preload
+M709 Reset MMU
+M705 report tool
+M706 MMU self-test
+M707 Sn	Set selector position directly
+M708 Kill MMU
+M710 scan i2c
+M711 drain PSU
+*/
+
 #define SCREEN_WIDTH 128     // OLED display width, in pixels
 #define SCREEN_HEIGHT 32     // OLED display height, in pixels
 #define SCREEN_ADDRESS 0x3C  ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
@@ -224,21 +241,7 @@ void processSerial() {
     }
   }
 }
-/*
-G48  test X/E at speed
-G0   move x,e
-G28  home x
-M701 Tn	Load filament n
-M702 Tn	Unload filament n
-M704 Preload
-M709 Reset MMU
-M705 report tool
-M706 MMU self-test
-M707 Sn	Set selector position directly
-M708 Kill MMU
-M710 scan i2c
-M711 drain PSU
-*/
+
 void run_command(GCode& gc) {
   if (gc.hasG) {
     switch (gc.G) {
