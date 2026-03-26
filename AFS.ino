@@ -1,5 +1,8 @@
+// to do
+//stepper drivers! ugh...
+//
+
 //FRAM storage stuff
-#include <Adafruit_EEPROM_I2C.h>
 #include <Adafruit_FRAM_I2C.h>
 //colour sensor
 #include <Adafruit_TCS34725.h>
@@ -9,56 +12,76 @@
 #include <SpeedyStepper.h>
 #include <Servo.h>
 //oled display stuff
-#include <SPI.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-//software reset!!
+#include "SSD1306Ascii.h"
+#include "SSD1306AsciiWire.h"
+//software reset!! (FOR AVR ONLY)
+#ifdef ARDUINO_ARCH_AVR
 #include <SoftwareReset.hpp>
+#endif
+//i2c GPIO expanders
+#include <Adafruit_MCP23X17.h>
+//Wire!
+#include <Wire.h>
 
 /*
 custom gcode commands :]
-G48  test X/E at speed
-G0   move x,e
+G0   move x,e,s
 G28  home x
+G38  auto test max accel and speed (S for speed else accel) 
+  these values are where it is no longer stable, so use something smaller than this
+  only tests the selector, manual tuning is required for extruder.
+
+G48  test X/E at speed
+
 M701 Tn	Load filament n
 M702 Tn	Unload filament n
 M704 Preload
-M709 Reset MMU
 M705 report tool
 M706 MMU self-test
 M707 Sn	Set selector position directly
 M708 Kill MMU
+M709 Reset MMU
 M710 scan i2c
-M711 drain PSU
+M711 test colour (optional S fo repeat delay)
+M712 get raw colour snesor values.
+M713 Detect curent color
+M714 DUMP FRAM (T to clear)
 */
 
-#define SCREEN_WIDTH 128     // OLED display width, in pixels
-#define SCREEN_HEIGHT 32     // OLED display height, in pixels
-#define SCREEN_ADDRESS 0x3C  ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32
+//definitions, DO NOT TOUCH unless you know what you are doing.
+
+//things to include or not
+#define useserial true              //enable the Serial interface
+#define useprefeederswitches false  //enable the prefeeder switches
+#define includedebugcommands true   //enable certain debug gcode commands
+
+//port expander i2c addresses
+#define mcpaaddr 32
+#define mcpbaddr 33
+
+//oled display adress
+#define SCREEN_ADDRESS 0x3C  ///< See datasheet for Address; 0x3D for 128x64, 0x3C for 128x32 (typically)
 
 //config
-#define useserial true    //enable the Serial interface
-#define serialspeed 9600  //baud rate of serial interface, default is 9600
-//allowable baud rates
-//300,600,750,1200,2400,4800,9600,19200,31250,38400,57600,74880,115200,230400,250000,460800,500000,921600,1000000,2000000
-//typical baud rates
-//9600,19200,115200
+#define serialspeed 115200  //baud rate of serial interface, default is 9600
+//  allowable baud rates
+//  300,600,750,1200,2400,4800,9600,19200,31250,38400,57600,74880,115200,230400,250000,460800,500000,921600,1000000,2000000
+//  typical baud rates
+//  9600,115200
 
-#define WIRE Wire  //for the i2c scanning function
+#define WIRE Wire     //for the i2c scanning function ( M710 over serial )
+#define LINE_BUF 128  //buffer size for gcode commands, should be greater than 8.
 
-#define LINE_BUF 96
 //pin definitions
-#define seldirPin 4        //direction pin of selector motor driver
-#define selstepPin 5       //step pin of the driver
-#define extdirPin 7        //direction pin of extruder motor driver
-#define extstepPin 8       //step pin of the driver
+#define seldirPin 7        //direction pin of selector motor driver
+#define selstepPin 8       //step pin of the driver
+#define extdirPin 4        //direction pin of extruder motor driver
+#define extstepPin 5       //step pin of the driver
 #define endstop 6          //pin of the endstop for the selector
 #define servopin 3         //selector servo pin
 #define enable_pin 2       //pin to enable/disable the stepper drivers
 #define inductiveprobe 12  //pin for the inductive probe for sensing filament
 #define LED_STRIP_PIN 11   //pin for the led strip across the front
-#define psuEnablePin 10    //pin used the enable the power supply for motors/probe
 
 //button input pins
 #define buttona A0
@@ -66,28 +89,44 @@ M711 drain PSU
 #define buttonc A2
 
 //motor characteristis
-//24v
+//24v ( needs calibrating)
 // #define Selspeed 9000   //max speed in steps/s of the selector motor
-// #define Extspeed 12000  //max speed in steps/s of the extrudor motor
+// #define Extspeed 12000  //max speed in steps/s of the extruder motor
 // #define accel 75000     //acceleration of both motors in steps/s2
 //12v
-#define Selspeed 4000   //max speed in steps/s of the selector motor
-#define Extspeed 8000  //max speed in steps/s of the extrudor motor
-#define accel 50000     //acceleration of both motors in steps/s2
+#define Selspeed 4000      //max speed in steps/s of the selector motor
+#define Extspeed 8000      //max speed in steps/s of the extruder motor
+#define Extslowspeed 2000  //max speed in steps/s of the extruder motor
+#define accel 120000       //acceleration of both motors in steps/s/s
+#define homespeed 12       //mm/s for homing speed of the selector
 
 //physical hardware details
-#define firstpos 7   //mm from 0 where the first filament resides
-#define increment 8  //increment in mm in between each consecutive filament slot
-#define tools 29     //one less than the total filament slots
-#define maxpos 240   //maximum position of the selector in mm
-#define mindistfromhome 5
+#define firstpos 6.5       //mm from 0 where the first filament resides
+#define increment 10       //increment in mm in between each consecutive filament slot
+#define tools 23           //one less than the total filament slots
+#define maxpos 236         //maximum position of the selector in mm
+#define mindistfromhome 5  //safe position to move to after homing
 
 //selector definitions
-#define distancetoprobe 25         //the distance at which the filament has to move from the probe to not collide with the selector.
-#define distancetocoloursensor 10  //the distance past the prob activation that the filament has to be pushed for the colour snesor to detect it.
-#define bowdentubelength 550       //length in mm of the bowden tube to the extruder on the tool head.
-#define servoengagedpos 50         //position for the servo motor to engage the filament
-#define servodisengagedpos 80      //safe position away from the filament for the servo motor to spin to.
+#define distancetoprobe 40         //the distance at which the filament has to move from the probe to not collide with the selector.
+#define distancetocoloursensor 50  //the distance past the prob activation that the filament has to be pushed for the colour sensor to detect it. (preferable to let a little go further)
+#define bowdentubelength 350       //length in mm of the bowden tube to the extruder on the tool head.
+#define servoengagedpos 90         //position for the servo motor to engage the filament
+#define servodisengagedpos 140     //position away from the filament for the servo motor to spin to.
+#define servosafehomepos 180       //safe position for the servo moto to go to when homing.
+#define stepspermili 14.72
+
+//colour offsets
+#define redoffset 55
+#define greenoffset 91
+#define blueoffset 104
+
+#define tcsdelay 625
+
+#define highlightcolour strip.Color(127, 0, 255)
+#define basecolour strip.Color(255, 64, 0)
+#define startupcolour strip.Color(0, 255, 0)
+#define brightness 16
 
 //init fram object
 Adafruit_FRAM_I2C fram = Adafruit_FRAM_I2C();
@@ -98,24 +137,41 @@ struct GCode {
 };
 GCode gc;
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+#if useprefeederswitches
+Adafruit_MCP23X17 mcpa;
+Adafruit_MCP23X17 mcpb;
+#endif
+
+// Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+SSD1306AsciiWire display;
+
 //defining motors
 SpeedyStepper selector;
 SpeedyStepper extruder;
 Servo servo;
 
 //defning the colour stuff (oohh shiny)
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);  //colour sensor
-Adafruit_NeoPixel strip(tools + 1, LED_STRIP_PIN, NEO_RGB + NEO_KHZ800);
-bool enablecolour = 1;
-byte colours[tools][3];  //array to store the colour values(rgb for each tool)
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_614MS, TCS34725_GAIN_4X);  //colour sensor
+Adafruit_NeoPixel strip(tools + 1, LED_STRIP_PIN, NEO_GRB + NEO_KHZ800);
+byte colours[3][tools];  //array to store the colour values(rgb for each tool)
 
 //global variable definitions
 bool engaged = 0;
 int curtool = 0;
 bool startchecksran = 0;
 bool LOADED = 0;
+bool enablecolour = 0;
 bool FRAMENABLED = 0;
+bool prefeederswitches = 0;
+bool filamentrunout = 0;
+
+int statled = 0;
+
+#if useprefeederswitches
+uint32_t prefeedbuttons = 0;
+uint32_t oldprefeedbuttons = 0;
+#endif
 
 //button stuff
 bool buttons[2][3];  //button list for storing current and previous states
@@ -138,29 +194,53 @@ bool redraw = 1;
 const byte menumaxval[] = { 4, tools, 1, 1, tools + 1, 1 };
 const byte menuminval[] = { 1, 0, 1, 1, 0, 1 };
 
+unsigned long long poweroncount = 0;
 //start of actual code
 void setup() {
-  //enable the psu
-  pinMode(psuEnablePin, OUTPUT);
-  digitalWrite(psuEnablePin, HIGH);
+#if useserial
+  Serial.begin(serialspeed);
+#endif
 
-  if (fram.begin()) {  //init the FRAM, if it's installed, if it's not detected, the program will keep going.
-    printStatus(F("Found FRAM\nWill save values"));
-    FRAMENABLED = 1;
-  } else {
-    printStatus(F("Could NOT find FRAM\nvalues will not\nbe saved"));
-  }
-  strip.begin();  // INITIALIZE NeoPixel strip object
-  strip.show();   // Turn OFF all pixels ASAP
-  strip.setBrightness(50);
+  // display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  display.begin(&Adafruit128x32, SCREEN_ADDRESS);
 
-  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS, 1, 1);
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+  display.clear();
+  display.setFont(System5x7);
   display.setCursor(0, 0);
   display.println(F("Initializing"));
-  display.display();
+
+
+  if (fram.begin()) {  //init the FRAM, if it's not detected, the program will keep going.
+    printStatus(F("Found FRAM"));
+    fram.readObject(32759, poweroncount);
+    if (poweroncount == 0xFFFFFFFFFFFFFFFF) {
+      poweroncount = 0;
+    }
+    fram.writeObject(32759, poweroncount + 1);
+    FRAMENABLED = 1;
+  } else {
+    printStatus(F("No FRAM"));
+  }
+
+  strip.begin();  // INITIALIZE NeoPixel strip object
+  strip.clear();
+  strip.setBrightness(brightness);
+  strip.fill(startupcolour);
+  strip.show();
+  loadingleds(statled++, basecolour, highlightcolour);
+
+#if useprefeederswitches
+  if (mcpa.begin_I2C() && mcpb.begin_I2C()) {
+    prefeederswitches = 1;
+    for (int i = 0; i < 15; i++) {
+      mcpa.pinMode(i, INPUT_PULLUP);
+      mcpb.pinMode(i, INPUT_PULLUP);
+    }
+  } else {
+    printStatus(F("no prefeed switches"));
+  }
+  loadingleds(statled++, basecolour, highlightcolour);
+#endif
 
   pinMode(buttona, INPUT_PULLUP);
   pinMode(buttonb, INPUT_PULLUP);
@@ -169,9 +249,11 @@ void setup() {
   pinMode(enable_pin, OUTPUT);
   pinMode(endstop, INPUT_PULLUP);
   pinMode(LED_BUILTIN, OUTPUT);
-  pinMode(inductiveprobe, INPUT_PULLUP);
+  pinMode(inductiveprobe, INPUT);
 
   disableMotors();
+
+  loadingleds(statled++, basecolour, highlightcolour);
 
   servo.attach(servopin);
   servo.write(180);
@@ -186,33 +268,32 @@ void setup() {
 
   extruder.setSpeedInStepsPerSecond(Extspeed);
   extruder.setAccelerationInStepsPerSecondPerSecond(accel);
-  extruder.setStepsPerMillimeter(17.3);  //change and calibrate later, this is a temporary value and needs to be measured
+  extruder.setStepsPerMillimeter(stepspermili);  //change and calibrate later, this is a temporary value and needs to be measured
 
-#if useserial
-  Serial.begin(serialspeed);
-#endif
+  loadingleds(statled++, basecolour, highlightcolour);
+
   if (tcs.begin()) {
     printStatus(F("Found colour\nsensor!"));
     enablecolour = 1;
   } else {
-    printStatus(F("Colour sensor\nnot found\ndisabling colour."));
+    printStatus(F("no colour sensor"));
     enablecolour = 0;
-    delay(5000);
   }
+  loadingleds(statled++, basecolour, highlightcolour);
   if (FRAMENABLED) {
     restoreFromFRAM();
-    if (enablecolour) {
-      updateleds();
-    }
   }
   printStatus(F("initialized"));
+  loadingleds(statled++, basecolour, highlightcolour);
 }
 
 //main loop
 void loop() {
   if (startchecksran == 0) {
-    if (!digitalRead(inductiveprobe)) {
+    if (digitalRead(inductiveprobe)) {
       runstartupchecks();
+      restoreFromFRAM();
+      updateleds();
     }
   }
   updatebuttonstate();
@@ -221,6 +302,10 @@ void loop() {
 
 #if useserial
   processSerial();
+#endif
+
+#if useprefeederswitches
+  processprefeedswitches();
 #endif
 }
 void processSerial() {
@@ -260,6 +345,14 @@ void run_command(GCode& gc) {
         }
         disableMotors();
         return;
+      case 38:
+        if (gc.hasS) {
+          getmaxspeed(250);
+        } else {
+          getmaxaccel(1000);
+        }
+        homeSelector();
+        return;
       case 0:
         if (gc.hasE) {
           moveExtruder(gc.E);
@@ -268,6 +361,9 @@ void run_command(GCode& gc) {
           enableMotors();
           selector.moveToPositionInMillimeters(gc.X);
           disableMotors();
+        }
+        if (gc.hasS) {
+          servo.write(gc.S);
         }
         return;
       case 28:
@@ -284,53 +380,105 @@ void run_command(GCode& gc) {
         if (gc.hasT) {
           select(gc.T);
           Loadfilament();
-        } else Serial.println(F("error: T missing"));
+        } else missingT();
         return;
 
       case 702:
-        if (gc.hasT) {
-          Unloadfilament();
-        } else Serial.println(F("error: T missing"));
+        Unloadfilament();
         return;
       case 704:
         if (gc.hasT) {
           select(gc.T);
           Preloadfilament();
-        } else Serial.println(F("error: T missing"));
+        } else missingT();
         return;
       case 705:
         Serial.print(F("T"));
         Serial.println(curtool);
         return;
+
+      case 707:
+        if (gc.hasT) {
+          select(gc.T);
+        } else missingT();
+        return;
+
+      case 713:
+        detectcolour(curtool);
+        return;
+#if includedebugcommands
       case 706:
         startchecksran = 0;
         runstartupchecks();
         return;
-      case 707:
-        if (gc.hasT) {
-          select(gc.T);
-        } else Serial.println(F("error: T missing"));
-        return;
+
       case 708:
         STOP();
         return;
       case 709:
-        Serial.println(F("resetting..."));
         printStatus(F("resetting..."));
+#ifdef ARDUINO_ARCH_AVR
         softwareReset::standard();
+#endif
+#ifndef ARDUINO_ARCH_AVR
+        NVIC_SystemReset();
+#endif
         return;
       case 710:
         scani2c();
         return;
       case 711:
-        printStatus(F("Draining residual\npower from PSU"));\
-        enableMotors();
-        while (selector.moveToHomeInMillimeters(1, 10, 248, endstop) == true) {}
-        disableMotors();
+        testcolour();
+        if (gc.hasS) {
+          while (true) {
+            testcolour();
+            delay(gc.S);
+          }
+        }
         return;
+
+      case 714:
+        if (gc.hasX) {
+          for (long i = 0; i < 32768; i++) {
+            fram.write(i, gc.X);
+          }
+        }
+        Serial.print(F("\nFRAM DUMP"));
+        for (long i = 0; i < (gc.hasT ? gc.T : 32768); i++) {
+          if (i % 256 == 0) {
+            Serial.println();
+            Serial.print(i, HEX);
+            Serial.print(F(" : "));
+          }
+          Serial.print(fram.read(i), HEX);
+        }
+        return;
+
+      case 712:
+        strip.clear();
+        strip.show();
+        delay(10);
+        float red, green, blue;
+        tcs.setInterrupt(false);  // turn on LED
+        delay(tcsdelay);          // takes 50ms to read
+        tcs.getRGB(&red, &green, &blue);
+        tcs.setInterrupt(true);  // turn off LED
+
+        Serial.print(F("R: "));
+        Serial.print(red);
+        Serial.print(F(" G: "));
+        Serial.print(green);
+        Serial.print(F(" B: "));
+        Serial.println(blue);
+        return;
+#endif
     }
   }
   Serial.println(F("error: unknown command"));
+}
+
+void missingT() {
+  Serial.println(F("error: T missing"));
 }
 
 void process_line(char* line) {
@@ -376,6 +524,10 @@ void parse_gcode(char* s) {
         gc.hasE = true;
         gc.E = value;
         break;
+      case 'S':
+        gc.hasS = true;
+        gc.S = value;
+        break;
     }
   }
 }
@@ -394,7 +546,7 @@ void PROCESSMENU() {
       redraw = 1;
     } else if (menu == MENU_PRELOADALL2) {
     } else {
-      menu = cursor;
+      menu = MenuState(cursor);
       redraw = 1;
     }
   }
@@ -409,14 +561,14 @@ void drawMenu() {
   if (!redraw) return;
   redraw = false;
 
-  display.clearDisplay();
+  display.clear();
   display.setCursor(0, 0);
 
   switch (menu) {
     case MENU_MAIN:
       display.println(cursor == 1 ? F("> Select Tool") : F("  Select Tool"));
       display.println(cursor == 2 ? F("> Preload Current") : F("  Preload Current"));
-      if (LOADED == 1) {
+      if (LOADED == 0) {
         display.println(cursor == 3 ? F("> Load") : F("  Load"));
       } else {
         display.println(cursor == 3 ? F("> Unload") : F("  Unload"));
@@ -451,7 +603,6 @@ void drawMenu() {
       PreloadALL(cursor);
       break;
   }
-  display.display();
 }
 
 void disableMotors() {
@@ -465,6 +616,8 @@ void enableMotors() {
 void STOP() {
   disableMotors();
   servo.write(180);
+  strip.fill(strip.Color(255, 0, 0), 0, tools + 1);
+  strip.show();
   printStatus(F("MMU STOPPED"));
   while (true) {
     digitalWrite(LED_BUILTIN, HIGH);
@@ -474,11 +627,11 @@ void STOP() {
   }
 }
 
-void printStatus(const __FlashStringHelper status[]) {
-  display.clearDisplay();
+void printStatus(const __FlashStringHelper* status) {
+  Serial.println(status);
+  display.clear();
   display.setCursor(0, 0);
   display.println(status);
-  display.display();
 }
 
 void disengage() {
@@ -500,18 +653,18 @@ void select(int tool) {
     redraw = 1;
     return;
   }
-  display.clearDisplay();
+  display.clear();
   display.setCursor(0, 0);
   enableMotors();
   if ((tool > tools) + (tool < 0)) {
     display.println(F("Tool Selection\nOut Of Range"));
-    display.display();
+
   } else {
     display.print(F("switching tool\nT"));
     display.print(curtool);
     display.print(F(" -> T"));
     display.print(tool);
-    display.display();
+
     if (engaged == false) {
       selector.moveToPositionInMillimeters(firstpos + (increment * min(max(tool, 0), tools)));
     }
@@ -522,9 +675,9 @@ void select(int tool) {
 
 void homeSelector() {
   printStatus(F("Homing Selector"));
-  servo.write(110);
+  servo.write(servosafehomepos);
   enableMotors();
-  if (selector.moveToHomeInMillimeters(1, 10, 248, endstop) != true) {
+  if (selector.moveToHomeInMillimeters(1, 10, maxpos * 1.2, endstop) != true) {
     STOP();
   }
   selector.setSpeedInStepsPerSecond(1600);
@@ -549,20 +702,59 @@ void moveExtruder(float MM) {
 }
 
 void runstartupchecks() {
+  loadingleds(statled++, basecolour, highlightcolour);
+  engage();
+  extruder.setSpeedInStepsPerSecond(Extslowspeed);
+  moveExtruder(distancetoprobe + 10);
+  if (!digitalRead(inductiveprobe)) {
+    enableMotors();
+
+    while (digitalRead(inductiveprobe)) {
+      extruder.moveRelativeInSteps(1);
+    }
+    while (!digitalRead(inductiveprobe)) {
+      extruder.moveRelativeInSteps(-1);
+    }
+
+    printStatus(F("Retracting from\nSelector"));
+    moveExtruder(-distancetoprobe);
+  }
+
+  disengage();
+
   homeSelector();
+
+  loadingleds(statled++, basecolour, highlightcolour);
+
   printStatus(F("Testing Selector"));
   enableMotors();
+
+  loadingleds(statled++, basecolour, highlightcolour);
+
   selector.moveToPositionInMillimeters(maxpos);
   printStatus(F("Testing Extruder"));
+
+  loadingleds(statled++, basecolour, highlightcolour);
+
   moveExtruder(200);
   moveExtruder(-200);
   printStatus(F("Testing Servo"));
+
+  loadingleds(statled++, basecolour, highlightcolour);
+
   engage();
   delay(250);
   disengage();
   startchecksran = 1;
+
+  loadingleds(statled++, basecolour, highlightcolour);
+
   select(0);
   disableMotors();
+
+  loadingleds(statled++, basecolour, highlightcolour);
+
+  testcolour();
   printStatus(F("Done!"));
   redraw = 1;
 }
@@ -586,36 +778,50 @@ bool getbutton(byte buttonnum) {
 void Unloadfilament() {
   engage();
   printStatus(F("Retracting"));
-  enableMotors();
-  extruder.moveToHomeInMillimeters(-1, 10, bowdentubelength + 50, inductiveprobe);
-  printStatus(F("Retracting from\nSelector"));
   extruder.setSpeedInStepsPerSecond(Extspeed);
+  moveExtruder(-bowdentubelength);
+  enableMotors();
+  extruder.setSpeedInStepsPerSecond(Extslowspeed);
+
+  while (digitalRead(inductiveprobe)) {
+    extruder.moveRelativeInSteps(1);
+  }
+  while (!digitalRead(inductiveprobe)) {
+    extruder.moveRelativeInSteps(-1);
+  }
+
+  printStatus(F("Retracting from\nSelector"));
   moveExtruder(-distancetoprobe);
   disengage();
+  disableMotors();
+  LOADED = 0;
 }
 void Loadfilament() {
   engage();
   printStatus(F("Loading into\nSelector"));
   extruder.setSpeedInStepsPerSecond(Extspeed);
-  moveExtruder(distancetoprobe);
   enableMotors();
-  extruder.moveToHomeInMillimeters(1, 10, 25, inductiveprobe);
+  feedtoprobe();
   printStatus(F("Loading to\nToolhead"));
+  extruder.setSpeedInStepsPerSecond(Extslowspeed);
+  moveExtruder(distancetocoloursensor);
   extruder.setSpeedInStepsPerSecond(Extspeed);
   moveExtruder(bowdentubelength);
   disengage();
+  disableMotors();
+  LOADED = 1;
 }
 
 void Preloadfilament() {
   engage();
   enableMotors();
   printStatus(F("Feeding to Probe"));
-  extruder.moveToHomeInMillimeters(-1, 5, 32000, inductiveprobe);
-  extruder.setSpeedInStepsPerSecond(Extspeed);
+  feedtoprobe();
+  extruder.setSpeedInStepsPerSecond(Extslowspeed);
   moveExtruder(-distancetoprobe);
   enableMotors();
-  extruder.moveToHomeInMillimeters(-1, 5, 40, inductiveprobe);
-  extruder.setSpeedInStepsPerSecond(Extspeed);
+  feedtoprobe();
+  extruder.setSpeedInStepsPerSecond(Extslowspeed);
   moveExtruder(-distancetoprobe);
   disableMotors();
   disengage();
@@ -625,31 +831,47 @@ void Preloadfilament() {
   }
 }
 
+void feedtoprobe() {
+  while (digitalRead(inductiveprobe)) {
+    extruder.moveRelativeInSteps(1);
+  }
+  while (!digitalRead(inductiveprobe)) {
+    extruder.moveRelativeInSteps(-1);
+  }
+}
 void detectcolour(int selectedtool) {
   if (curtool != selectedtool) {
     select(selectedtool);
   }
 
   engage();
+  enableMotors();
   printStatus(F("Loading into\nSelector"));
-  extruder.setSpeedInStepsPerSecond(Extspeed);
-  moveExtruder(distancetoprobe);
-  extruder.moveToHomeInMillimeters(1, 10, 25, inductiveprobe);
+  extruder.setSpeedInStepsPerSecond(Extslowspeed);
+  feedtoprobe();
   printStatus(F("Loading to\ncolour sensor"));
-  extruder.setSpeedInStepsPerSecond(Extspeed);
+  extruder.setSpeedInStepsPerSecond(Extslowspeed);
   moveExtruder(distancetocoloursensor);
+  disableMotors();
 
   //do colour stuff
+  strip.clear();
+  strip.show();
   float red, green, blue;
   tcs.setInterrupt(false);  // turn on LED
-  delay(60);                // takes 50ms to read
+  delay(tcsdelay);          // takes 50ms to read
   tcs.getRGB(&red, &green, &blue);
   tcs.setInterrupt(true);  // turn off LED
+
+  red = max(red - redoffset, 0);
+  green = max(green - greenoffset, 0);
+  blue = max(blue - blueoffset, 0);
+
   colours[0][selectedtool] = byte(red);
   colours[1][selectedtool] = byte(green);
   colours[2][selectedtool] = byte(blue);
   //print colour info to display
-  display.clearDisplay();
+  display.clear();
   display.setCursor(0, 0);
   display.print(F("colour Read!\nR:"));
   display.print(colours[0][selectedtool]);
@@ -658,29 +880,28 @@ void detectcolour(int selectedtool) {
   display.print(F("\nB:"));
   display.print(colours[2][selectedtool]);
   display.print(F("\nRetracting"));
-  display.display();
+
   //pull filament back out of the selector
   engage();
   enableMotors();
-  extruder.moveToHomeInMillimeters(-1, 10, distancetocoloursensor + 10, inductiveprobe);
-  extruder.setSpeedInStepsPerSecond(Extspeed);
+  extruder.moveToHomeInMillimeters(1, 10, distancetocoloursensor + 10, inductiveprobe);
+  extruder.setSpeedInStepsPerSecond(Extslowspeed);
   moveExtruder(-distancetoprobe);
   disengage();
+  disableMotors();
 }
 
 void updateleds() {
   for (int i = 0; i < tools; i++) {
-    strip.setPixelColor(i, strip.gamma32(strip.Color(colours[0][i], colours[1][i], colours[2][i])));
+    strip.setPixelColor(i, strip.Color(colours[0][i], colours[1][i], colours[2][i]));
   }
+  strip.show();
+  updateFRAM();
 }
 void PreloadALL(int toolcount) {
   for (int i = 0; i < toolcount; i++) {
     select(i);
     Preloadfilament();
-    if (enablecolour) {
-      detectcolour(i);
-      updateleds();
-    }
   }
   if (FRAMENABLED) {
     updateFRAM();
@@ -691,7 +912,7 @@ void PreloadALL(int toolcount) {
 
 void updateFRAM() {
   printStatus(F("updating FRAM\nValues"));
-  for (int j = 0; j < 2; j++) {
+  for (int j = 0; j < 3; j++) {
     for (int i = 0; i < tools; i++) {
       fram.write(i + (j * tools), colours[j][i]);
     }
@@ -699,7 +920,7 @@ void updateFRAM() {
 }
 void restoreFromFRAM() {
   printStatus(F("restoring FRAM\nValues"));
-  for (int j = 0; j < 2; j++) {
+  for (int j = 0; j < 3; j++) {
     for (int i = 0; i < tools; i++) {
       colours[j][i] = fram.read(i + (j * tools));
     }
@@ -709,11 +930,6 @@ void restoreFromFRAM() {
 void scani2c() {
   byte error, address;
   int nDevices;
-
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println(F("scanning at address"));
-  display.drawRect(0, 20, 127, 6, 1);
   Serial.println("Scanning...");
   nDevices = 0;
   for (address = 1; address < 127; address++) {
@@ -722,15 +938,6 @@ void scani2c() {
     // a device did acknowledge at the address.
     WIRE.beginTransmission(address);
     error = WIRE.endTransmission();
-    display.setCursor(0, 8);
-    display.drawRect(0, 8, 16, 8, 0);
-    display.drawRect(1, 9, 14, 6, 0);
-    display.drawRect(2, 10, 12, 4, 0);
-    display.drawRect(3, 11, 10, 2, 0);
-    display.print(address);
-    display.drawRect(0, 21, address, 4, 1);
-    display.drawRect(0, 22, address, 2, 1);
-    display.display();
     if (error == 0) {
       Serial.print("I2C device found at address 0x");
       if (address < 16)
@@ -748,15 +955,208 @@ void scani2c() {
   if (nDevices == 0)
     Serial.println("No I2C devices found\n");
   else
-    Serial.println("done\n");
-  display.clearDisplay();
+    Serial.println("done");
+  display.clear();
   display.setCursor(0, 0);
   display.print(F("found "));
   display.print(nDevices);
-  if (nDevices == 1) {
-    display.print(F(" device"));
-  } else {
-    display.print(F(" devices"));
+  display.print(F(" device"));
+  if (nDevices != 1) {
+    display.print(F("s"));
   }
-  display.display();
+}
+void testcolour() {  //do colour stuff
+  if (enablecolour) {
+    strip.fill(strip.Color(0, 0, 0));
+    strip.show();
+    float red, green, blue;
+    tcs.setInterrupt(false);  // turn on LED
+    delay(tcsdelay);          // takes 50ms to illuminate
+    tcs.getRGB(&red, &green, &blue);
+    tcs.setInterrupt(true);  // turn off LED
+    red = max(red - redoffset, 0);
+    green = max(green - greenoffset, 0);
+    blue = max(blue - blueoffset, 0);
+    Serial.println(red);
+    Serial.println(green);
+    Serial.println(blue);
+    //print colour info to display
+    display.clear();
+    display.setCursor(0, 0);
+    display.print(F("colour Read!\nR:"));
+    display.print(round(red));
+    display.print(F(" G:"));
+    display.print(byte(green));
+    display.print(F("\nB:"));
+    display.print(byte(blue));
+
+    strip.clear();
+    strip.fill(strip.Color(byte(red), byte(green), byte(blue)), 0, tools + 1);
+    strip.show();
+  } else {
+    printStatus(F("colour sensor\nnot initialized."));
+  }
+}
+
+#if useprefeederswitches
+void updateswitches() {
+  oldprefeedbuttons = prefeedbuttons;
+  prefeedbuttons = 0;
+  for (int i = 0; i < 15; i++) {
+    prefeedbuttons += mcpa.digitalRead(i) << i;
+    prefeedbuttons += mcpb.digitalRead(i) << (i + 16);
+  }
+}
+
+void processprefeedswitches() {
+  updateswitches();
+  byte detectedtool = detectswitches();
+  if (detectedtool == 255) { return; }
+  if (LOADED && (curtool == detectedtool)) {
+    filamentrunout = 1;
+    return;
+  }
+  if (LOADED == false) {
+    select(detectedtool);
+    Preloadfilament();
+  }
+}
+
+byte detectswitches() {
+  if (oldprefeedbuttons != prefeedbuttons) {
+    uint32_t temp = oldprefeedbuttons ^ prefeedbuttons;
+    for (int i = 0; i < 31; i++) {
+      if ((temp >> i) & 1) {
+        return i;
+      }
+    }
+  }
+  return 255;
+}
+#endif
+
+void processrunout() {
+  /*
+  1: tell printer we're out of filament
+  2:wait for it to finish moving
+  3:wait for it to say unload.
+  4:unload
+  5:detect if spool join
+
+  if spool join
+  6:load next filament
+
+  if no spool join
+  6:notify somehow? (flash lights on front maybe?)
+  */
+}
+
+void loadingleds(int lednum, uint32_t lbasecolour, uint32_t colour) {
+  strip.fill(lbasecolour);
+  strip.setPixelColor(lednum, colour);
+  strip.show();
+}
+
+bool tryaccel(long acceleration) {
+  delay(15);
+  Serial.print(F("\ntrying accel:"));
+  Serial.print(acceleration);
+  selector.setAccelerationInStepsPerSecondPerSecond(acceleration);
+  selector.moveToPositionInMillimeters((maxpos / 2) - 10);
+  selector.setAccelerationInStepsPerSecondPerSecond(accel);
+  if (selector.moveToHomeInMillimeters(1, homespeed, (maxpos / 2) - 11, endstop)) {
+    return false;
+  } else {
+    if (!selector.moveToHomeInMillimeters(1, homespeed, maxpos / 2, endstop)) { STOP(); }
+    selector.setAccelerationInStepsPerSecondPerSecond(acceleration);
+    selector.moveToPositionInMillimeters((maxpos / 2) - 10);
+    selector.setAccelerationInStepsPerSecondPerSecond(accel);
+    if (selector.moveToHomeInMillimeters(1, homespeed, (maxpos / 2) - 11, endstop)) {
+      return false;
+    } else {
+      if (!selector.moveToHomeInMillimeters(1, homespeed, maxpos / 2, endstop)) { STOP(); }
+      return true;
+    }
+  }
+}
+
+long getmaxaccel(long inc) {
+  homeSelector();
+  long low = inc;
+  long high = inc;
+
+  enableMotors();
+
+  while (tryaccel(high)) {
+    low = high;
+    high <<= 1;
+  }
+
+  while ((high - low) > 2) {
+    long mid = low + ((high - low) >> 1);
+
+    if (tryaccel(mid)) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  disableMotors();
+
+  Serial.print(F("\nmax acceleration found:"));
+  Serial.print(low);
+  Serial.println(F("steps/s/s"));
+  return low;
+}
+
+bool tryspeed(long speed) {
+  delay(15);
+  Serial.print(F("\ntrying speed:"));
+  Serial.print(speed);
+  selector.setSpeedInStepsPerSecond(speed);
+  selector.moveToPositionInMillimeters((maxpos / 2) - 10);
+  selector.setSpeedInStepsPerSecond(Selspeed);
+  if (selector.moveToHomeInMillimeters(1, homespeed, (maxpos / 2) - 11, endstop)) {
+    return false;
+  } else {
+    if (!selector.moveToHomeInMillimeters(1, homespeed, maxpos / 2, endstop)) { STOP(); }
+    selector.setSpeedInStepsPerSecond(speed);
+    selector.moveToPositionInMillimeters((maxpos / 2) - 10);
+    selector.setSpeedInStepsPerSecond(Selspeed);
+    if (selector.moveToHomeInMillimeters(1, homespeed, (maxpos / 2) - 11, endstop)) {
+      return false;
+    } else {
+      if (!selector.moveToHomeInMillimeters(1, homespeed, maxpos / 2, endstop)) { STOP(); }
+      return true;
+    }
+  }
+}
+
+long getmaxspeed(long inc) {
+  homeSelector();
+  long low = inc;
+  long high = inc;
+
+  enableMotors();
+
+  while (tryspeed(high)) {
+    low = high;
+    high <<= 1;
+  }
+
+  while ((high - low) > 2) {
+    long mid = low + ((high - low) >> 1);
+
+    if (tryspeed(mid)) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  disableMotors();
+
+  Serial.print(F("\nmax speed found:"));
+  Serial.print(low);
+  Serial.println(F("steps/s"));
+  return low;
 }
